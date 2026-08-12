@@ -165,4 +165,69 @@ describe('ImapService', () => {
       expect(client.messageFlagsAdd).toHaveBeenCalledWith('10', ['\\Flagged'], { uid: true });
     });
   });
+
+  // -----------------------------------------------------------------------
+  // Mailbox-scoped IDs
+  //
+  // IMAP UIDs are unique only within a mailbox, so an ID must select the
+  // mailbox it came from. Resolving one against the wrong mailbox returns a
+  // different, real message instead of an error — these tests pin the mailbox
+  // each operation actually locks.
+  // -----------------------------------------------------------------------
+
+  describe('mailbox-scoped IDs', () => {
+    const SCOPED = '[Gmail]/All Mail:212711';
+
+    it('moveEmail locks the mailbox named in the ID, not the argument', async () => {
+      // A real (non-virtual) folder: moveEmail refuses to move out of Gmail's
+      // virtual All Mail regardless of how the mailbox was resolved.
+      client.list.mockResolvedValue([{ name: 'Receipts', path: 'Receipts' }]);
+
+      await service.moveEmail('test', 'Receipts:8817', 'INBOX', 'Archive');
+
+      expect(client.getMailboxLock).toHaveBeenCalledWith('Receipts');
+      expect(client.messageMove).toHaveBeenCalledWith('8817', 'Archive', { uid: true });
+    });
+
+    it('setFlags locks the mailbox named in the ID', async () => {
+      await service.setFlags('test', SCOPED, 'INBOX', 'read');
+
+      expect(client.getMailboxLock).toHaveBeenCalledWith('[Gmail]/All Mail');
+      expect(client.messageFlagsAdd).toHaveBeenCalledWith('212711', ['\\Seen'], { uid: true });
+    });
+
+    it('deleteEmail locks the mailbox named in the ID', async () => {
+      await service.deleteEmail('test', SCOPED, 'INBOX', true);
+
+      expect(client.getMailboxLock).toHaveBeenCalledWith('[Gmail]/All Mail');
+      expect(client.messageDelete).toHaveBeenCalledWith('212711', { uid: true });
+    });
+
+    it('still resolves bare legacy UIDs against the mailbox argument', async () => {
+      await service.setFlags('test', '10', '[Gmail]/Sent Mail', 'read');
+
+      expect(client.getMailboxLock).toHaveBeenCalledWith('[Gmail]/Sent Mail');
+      expect(client.messageFlagsAdd).toHaveBeenCalledWith('10', ['\\Seen'], { uid: true });
+    });
+
+    it('bulkDelete refuses IDs spanning mailboxes instead of guessing', async () => {
+      await expect(
+        service.bulkDelete('test', ['INBOX:1', '[Gmail]/All Mail:2'], 'INBOX', true),
+      ).rejects.toThrow(/single mailbox/);
+
+      expect(client.messageDelete).not.toHaveBeenCalled();
+    });
+
+    it('bulkSetFlags applies UIDs to the mailbox the IDs name', async () => {
+      await service.bulkSetFlags(
+        'test',
+        ['[Gmail]/All Mail:1', '[Gmail]/All Mail:2'],
+        'INBOX',
+        'mark_read',
+      );
+
+      expect(client.getMailboxLock).toHaveBeenCalledWith('[Gmail]/All Mail');
+      expect(client.messageFlagsAdd).toHaveBeenCalledWith('1,2', ['\\Seen'], { uid: true });
+    });
+  });
 });

@@ -20,10 +20,14 @@ export default function registerBulkTools(server: McpServer, imapService: ImapSe
         .enum(['mark_read', 'mark_unread', 'flag', 'unflag', 'move', 'delete'])
         .describe('Bulk action to perform'),
       ids: z
-        .array(z.number().int())
+        .array(z.union([z.string(), z.number().int()]))
         .min(1)
         .max(100)
-        .describe('Array of email UIDs (max 100). Get UIDs from list_emails or search_emails.'),
+        .describe(
+          'Array of email IDs from list_emails or search_emails (max 100). IDs are ' +
+            'mailbox-scoped ("[Gmail]/All Mail:212711"); all IDs in one call must belong ' +
+            'to the same mailbox. Bare UIDs are resolved against the `mailbox` parameter.',
+        ),
       destination: z
         .string()
         .optional()
