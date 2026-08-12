@@ -31,7 +31,10 @@ function formatEmailMeta(email: EmailMeta): string {
   const from = email.from.name ? `${email.from.name} <${email.from.address}>` : email.from.address;
   const labelStr = email.labels.length > 0 ? `\n  🏷️ ${email.labels.join(', ')}` : '';
 
-  return `[${email.id}] ${flags} ${email.subject}\n  From: ${from} | ${email.date}${labelStr}${email.preview ? `\n  ${email.preview}` : ''}`;
+  // IDs are quoted rather than bracketed: they are mailbox-scoped, and Gmail
+  // folder names contain brackets of their own ("[Gmail]/All Mail:212711"),
+  // which makes a bracketed ID ambiguous to anything parsing this output.
+  return `id="${email.id}" ${flags} ${email.subject}\n  From: ${from} | ${email.date}${labelStr}${email.preview ? `\n  ${email.preview}` : ''}`;
 }
 
 /** Strips HTML markup and decodes common entities to produce readable plain text. */
@@ -195,8 +198,20 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
       'Set markRead=true only when you want to explicitly mark the email as read.',
     {
       account: z.string().describe('Account name from list_accounts'),
-      emailId: z.string().describe('Email ID from list_emails or search_emails'),
-      mailbox: z.string().default('INBOX').describe('Mailbox path (default: INBOX)'),
+      emailId: z
+        .string()
+        .describe(
+          'Email ID from list_emails or search_emails. IDs are mailbox-scoped ' +
+            '("[Gmail]/All Mail:212711") and carry their own mailbox — pass them through ' +
+            'verbatim rather than stripping the prefix.',
+        ),
+      mailbox: z
+        .string()
+        .default('INBOX')
+        .describe(
+          'Mailbox path. Ignored when emailId is mailbox-scoped; used only to resolve ' +
+            'bare legacy UIDs (default: INBOX).',
+        ),
       format: z
         .enum(['full', 'text', 'stripped'])
         .default('full')
@@ -332,7 +347,7 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
 
           results.push(
             [
-              `━━━ [${emailId}] ${email.subject}`,
+              `━━━ id="${emailId}" ${email.subject}`,
               `Status: ${formatEmailStatus(email)}`,
               `From:   ${from}`,
               `Date:   ${email.date}`,
@@ -345,7 +360,7 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
           );
         } else {
           const err = outcome.reason as unknown;
-          errors.push(`[${emailId}] Error: ${err instanceof Error ? err.message : String(err)}`);
+          errors.push(`id="${emailId}" Error: ${err instanceof Error ? err.message : String(err)}`);
         }
       });
 
