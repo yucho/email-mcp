@@ -105,6 +105,161 @@ function findMimePartByFilename(
   return undefined;
 }
 
+// ---------------------------------------------------------------------------
+// MIME parsing of the already-fetched RFC822 source.
+//
+// Do NOT reintroduce `client.download(uid, '1')` here. imapflow's fetchOne()
+// returns the FIRST untagged FETCH response it observes, without checking that
+// the UID matches the one requested. A server may emit an unsolicited
+// `* N FETCH (FLAGS (...))` for an unrelated message at any time (RFC 3501
+// 7.4.2) -- typically a neighbouring UID whose flags a STORE just changed.
+// download() then rewrites its own fetch range from that stray response
+// (imap-flow.js: `uid = response.uid; range = uid;`) and streams a DIFFERENT
+// message's body. That is the "body swap" bug: correct headers, wrong body.
+//
+// Parsing `source` locally removes the extra round trips, so the bug cannot
+// occur. It also fixes a second defect: part '1' was hardcoded, which on
+// multipart/mixed > multipart/alternative messages returned the raw container
+// (MIME boundaries, undecoded base64) instead of readable text.
+// ---------------------------------------------------------------------------
+
+interface MimeNode {
+  headers: Record<string, string>;
+  body: Buffer;
+}
+
+/** The readable bodies found in a MIME tree, if any. */
+interface MimeBodies {
+  text?: string;
+  html?: string;
+}
+
+/** Split a raw MIME chunk into unfolded headers plus the body bytes. */
+function splitMime(raw: Buffer): MimeNode {
+  const s = raw.toString('binary');
+  let sep = s.indexOf('\r\n\r\n');
+  let skip = 4;
+  if (sep < 0) {
+    sep = s.indexOf('\n\n');
+    skip = 2;
+  }
+  if (sep < 0) return { headers: {}, body: raw };
+
+  const headers: Record<string, string> = {};
+  let current = '';
+  const commit = (): void => {
+    const colon = current.indexOf(':');
+    if (colon > 0) {
+      headers[current.slice(0, colon).trim().toLowerCase()] = current.slice(colon + 1).trim();
+    }
+    current = '';
+  };
+  // Byte offsets from the latin1 view map 1:1 onto the buffer, so the header
+  // block can be re-decoded as UTF-8 while the body stays raw bytes.
+  raw
+    .subarray(0, sep)
+    .toString('utf-8')
+    .split(/\r?\n/)
+    .forEach((line) => {
+      if (/^[ \t]/.test(line) && current) {
+        current += ` ${line.trim()}`;
+        return;
+      }
+      commit();
+      current = line;
+    });
+  commit();
+
+  return { headers, body: Buffer.from(s.slice(sep + skip), 'binary') };
+}
+
+/** Pull a parameter such as boundary= or charset= out of a header value. */
+function mimeParam(value: string, name: string): string | undefined {
+  const m = new RegExp(`${name}\\s*=\\s*(?:"([^"]*)"|([^;\\s]+))`, 'i').exec(value);
+  return m ? (m[1] ?? m[2]) : undefined;
+}
+
+function decodeQuotedPrintable(buf: Buffer): Buffer {
+  const s = buf.toString('binary').replace(/=(?:\r\n|\n|\r)/g, '');
+  const out: number[] = [];
+  // eslint-disable-next-line no-plusplus
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '=' && /^[0-9A-Fa-f]{2}$/.test(s.slice(i + 1, i + 3))) {
+      out.push(parseInt(s.slice(i + 1, i + 3), 16));
+      i += 2;
+    } else {
+      // eslint-disable-next-line no-bitwise
+      out.push(s.charCodeAt(i) & 0xff);
+    }
+  }
+  return Buffer.from(out);
+}
+
+function decodeTransfer(body: Buffer, encoding: string): Buffer {
+  const enc = encoding.toLowerCase().trim();
+  if (enc === 'base64') {
+    return Buffer.from(body.toString('ascii').replace(/[^A-Za-z0-9+/=]/g, ''), 'base64');
+  }
+  if (enc === 'quoted-printable') return decodeQuotedPrintable(body);
+  return body;
+}
+
+/** Decode bytes using the declared charset. Japanese mail is often ISO-2022-JP. */
+function decodeCharset(buf: Buffer, charset?: string): string {
+  const cs = (charset ?? 'utf-8').toLowerCase().replace(/["']/g, '').trim();
+  try {
+    return new TextDecoder(cs).decode(buf);
+  } catch {
+    return buf.toString('utf-8');
+  }
+}
+
+function splitByBoundary(body: Buffer, boundary: string): Buffer[] {
+  const s = body.toString('binary');
+  const delim = `--${boundary}`;
+  const marks: number[] = [];
+  for (let i = s.indexOf(delim); i !== -1; i = s.indexOf(delim, i + delim.length)) {
+    marks.push(i);
+  }
+  const parts: Buffer[] = [];
+  // eslint-disable-next-line no-plusplus
+  for (let k = 0; k < marks.length - 1; k++) {
+    const afterDelim = marks[k] + delim.length;
+    if (s.startsWith('--', afterDelim)) break; // closing delimiter
+    const nl = s.indexOf('\n', afterDelim);
+    // eslint-disable-next-line no-continue
+    if (nl === -1) continue;
+    parts.push(Buffer.from(s.slice(nl + 1, marks[k + 1]), 'binary'));
+  }
+  return parts;
+}
+
+/** Walk the MIME tree, collecting the first text/plain and text/html bodies. */
+function collectBodies(node: MimeNode, depth = 0): MimeBodies {
+  if (depth > 12) return {};
+  const contentType = node.headers['content-type'] ?? 'text/plain';
+  const mimeType = (contentType.split(';')[0] ?? '').trim().toLowerCase();
+
+  if (mimeType.startsWith('multipart/')) {
+    const boundary = mimeParam(contentType, 'boundary');
+    if (!boundary) return {};
+    // Depth-first: the first part to supply each of text/html wins, which for
+    // multipart/alternative is the sender's own preference order.
+    return splitByBoundary(node.body, boundary).reduce<MimeBodies>((acc, part) => {
+      if (acc.text !== undefined && acc.html !== undefined) return acc;
+      const found = collectBodies(splitMime(part), depth + 1);
+      return { text: acc.text ?? found.text, html: acc.html ?? found.html };
+    }, {});
+  }
+
+  if ((node.headers['content-disposition'] ?? '').toLowerCase().includes('attachment')) return {};
+  if (mimeType !== 'text/plain' && mimeType !== 'text/html') return {};
+
+  const decoded = decodeTransfer(node.body, node.headers['content-transfer-encoding'] ?? '');
+  const text = decodeCharset(decoded, mimeParam(contentType, 'charset'));
+  return mimeType === 'text/html' ? { html: text } : { text };
+}
+
 function messageToEmailMeta(msg: Record<string, unknown>, mailbox: string): EmailMeta {
   const envelope = (msg.envelope ?? {}) as Record<string, unknown>;
   const flags = new Set((msg.flags ?? []) as string[]);
@@ -112,17 +267,15 @@ function messageToEmailMeta(msg: Record<string, unknown>, mailbox: string): Emai
   // Extract non-system flags as labels (IMAP keywords)
   const labels = [...flags].filter((f) => !f.startsWith('\\'));
 
-  // Extract preview from source buffer
+  // Extract preview from source buffer. Uses the same MIME walk as the full
+  // body so that multipart messages preview as readable text rather than as
+  // MIME boundaries and undecoded base64.
   let preview: string | undefined;
   if (msg.source && Buffer.isBuffer(msg.source)) {
-    const rawText = msg.source.toString('utf-8');
-    // Try to extract body text after the header blank line
-    const bodyStart = rawText.indexOf('\r\n\r\n');
-    if (bodyStart >= 0) {
-      preview = rawText
-        .slice(bodyStart + 4, bodyStart + 204)
-        .replace(/\s+/g, ' ')
-        .trim();
+    const bodies = collectBodies(splitMime(msg.source));
+    const source = bodies.text ?? bodies.html?.replace(/<[^>]*>/g, ' ');
+    if (source) {
+      preview = source.slice(0, 400).replace(/\s+/g, ' ').trim().slice(0, 200);
     }
   }
 
@@ -143,59 +296,22 @@ function messageToEmailMeta(msg: Record<string, unknown>, mailbox: string): Emai
   };
 }
 
-async function messageToEmail(
-  msg: Record<string, unknown>,
-  client: ImapFlow,
-  uid: number,
-  mailbox: string,
-): Promise<Email> {
+async function messageToEmail(msg: Record<string, unknown>, mailbox: string): Promise<Email> {
   const meta = messageToEmailMeta(msg, mailbox);
   const envelope = (msg.envelope ?? {}) as Record<string, unknown>;
 
-  // Parse full source for body content
+  // Parse the fetched source locally. See the note above splitMime for why
+  // this must not go back to the server for individual body parts.
   let bodyText: string | undefined;
   let bodyHtml: string | undefined;
   const headers: Record<string, string> = {};
 
   if (msg.source && Buffer.isBuffer(msg.source)) {
-    const raw = msg.source.toString('utf-8');
-    const headerEnd = raw.indexOf('\r\n\r\n');
-    if (headerEnd >= 0) {
-      // Parse headers
-      const headerSection = raw.slice(0, headerEnd);
-      headerSection.split('\r\n').forEach((line) => {
-        const colonIdx = line.indexOf(':');
-        if (colonIdx > 0 && !line.startsWith(' ') && !line.startsWith('\t')) {
-          const key = line.slice(0, colonIdx).trim().toLowerCase();
-          const value = line.slice(colonIdx + 1).trim();
-          headers[key] = value;
-        }
-      });
-
-      const body = raw.slice(headerEnd + 4);
-      // Simple content type detection
-      const contentType = headers['content-type'] ?? '';
-      if (contentType.includes('text/html')) {
-        bodyHtml = body;
-      } else {
-        bodyText = body;
-      }
-    }
-  }
-
-  // Try to get text/html parts via download if body parsing was simple
-  try {
-    const textPart = await client.download(String(uid), '1', { uid: true });
-    if (textPart?.content) {
-      const chunks: Buffer[] = [];
-      // eslint-disable-next-line no-restricted-syntax
-      for await (const chunk of textPart.content) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      }
-      bodyText = Buffer.concat(chunks).toString('utf-8');
-    }
-  } catch {
-    // Part may not exist
+    const root = splitMime(msg.source);
+    Object.assign(headers, root.headers);
+    const bodies = collectBodies(root);
+    bodyText = bodies.text;
+    bodyHtml = bodies.html;
   }
 
   return {
@@ -427,12 +543,17 @@ export default class ImapService {
         throw new Error(`Email ${emailId} not found in ${safeMailbox}`);
       }
 
-      return await messageToEmail(
-        msg as unknown as Record<string, unknown>,
-        client,
-        uid,
-        safeMailbox,
-      );
+      // Defence in depth: imapflow's fetchOne() hands back the first untagged
+      // FETCH it observes, which may belong to an unrelated message (see the
+      // note above splitMime). Refuse to return someone else's mail.
+      if (typeof msg.uid === 'number' && msg.uid !== uid) {
+        throw new Error(
+          `IMAP returned UID ${msg.uid} for a fetch scoped to UID ${uid} in ${safeMailbox} ` +
+            '(stray untagged FETCH response). Retry the request.',
+        );
+      }
+
+      return await messageToEmail(msg as unknown as Record<string, unknown>, safeMailbox);
     } finally {
       lock.release();
     }
@@ -1416,8 +1537,7 @@ export default class ImapService {
         { uid: true },
       )) {
         const raw = msg as unknown as Record<string, unknown>;
-        const uid = raw.uid as number;
-        messages.push(await messageToEmail(raw, client, uid, mailbox));
+        messages.push(await messageToEmail(raw, mailbox));
       }
 
       // Sort chronologically
