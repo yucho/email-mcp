@@ -13,6 +13,8 @@ function createMockImapClient() {
     list: vi.fn().mockResolvedValue([]),
     status: vi.fn().mockResolvedValue({ messages: 5, unseen: 2 }),
     fetch: vi.fn().mockReturnValue((async function* fetchMock() {})()),
+    fetchOne: vi.fn().mockResolvedValue(false),
+    download: vi.fn().mockResolvedValue({ content: null }),
     search: vi.fn().mockResolvedValue([]),
     messageMove: vi.fn().mockResolvedValue(true),
     messageDelete: vi.fn().mockResolvedValue(true),
@@ -20,6 +22,30 @@ function createMockImapClient() {
     messageFlagsRemove: vi.fn().mockResolvedValue(true),
     _releaseFn: releaseFn,
   };
+}
+
+/** Join lines with CRLF, as a real RFC822 message uses. */
+function mime(...lines: (string | Buffer)[]): Buffer {
+  return Buffer.concat(
+    lines.flatMap((l) => [Buffer.isBuffer(l) ? l : Buffer.from(l, 'binary'), Buffer.from('\r\n')]),
+  );
+}
+
+/** A fetchOne/fetch result carrying `source`, the shape imapflow returns. */
+function message(uid: number, source: Buffer) {
+  return {
+    uid,
+    seq: uid,
+    flags: new Set(['\\Seen']),
+    envelope: { subject: 'Subject', from: [{ name: 'A', address: 'a@example.test' }] },
+    bodyStructure: {},
+    source,
+  };
+}
+
+/** The async iterator shape client.fetch() returns. */
+async function* iterate(...msgs: ReturnType<typeof message>[]) {
+  for (const msg of msgs) yield msg;
 }
 
 function createMockConnectionManager(mockClient: ReturnType<typeof createMockImapClient>) {
@@ -228,6 +254,200 @@ describe('ImapService', () => {
 
       expect(client.getMailboxLock).toHaveBeenCalledWith('[Gmail]/All Mail');
       expect(client.messageFlagsAdd).toHaveBeenCalledWith('1,2', ['\\Seen'], { uid: true });
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Body parsing
+  //
+  // Bodies come out of the `source` already fetched alongside the envelope.
+  // The service must never go back to the server for an individual part:
+  // imapflow's download() rewrites its own fetch range from the first untagged
+  // FETCH it observes, so a stray FLAGS notification for a neighbouring UID
+  // made it stream a different message's body under the right headers.
+  // -----------------------------------------------------------------------
+
+  describe('body parsing', () => {
+    const ALTERNATIVE = mime(
+      'From: a@example.test',
+      'Subject: Hello',
+      'Content-Type: multipart/alternative; boundary="b1"',
+      '',
+      '--b1',
+      'Content-Type: text/plain; charset=utf-8',
+      '',
+      'plain body',
+      '--b1',
+      'Content-Type: text/html; charset=utf-8',
+      '',
+      '<p>html body</p>',
+      '--b1--',
+    );
+
+    it('never downloads individual parts', async () => {
+      client.fetchOne.mockResolvedValue(message(42, ALTERNATIVE));
+
+      await service.getEmail('test', 'INBOX:42');
+
+      expect(client.download).not.toHaveBeenCalled();
+    });
+
+    it('rejects a fetch answered with a different message', async () => {
+      client.fetchOne.mockResolvedValue(message(43, ALTERNATIVE));
+
+      await expect(service.getEmail('test', 'INBOX:42')).rejects.toThrow(/stray untagged FETCH/);
+      expect(client._releaseFn).toHaveBeenCalled();
+    });
+
+    it('picks both parts out of multipart/alternative', async () => {
+      client.fetchOne.mockResolvedValue(message(42, ALTERNATIVE));
+
+      const email = await service.getEmail('test', 'INBOX:42');
+
+      expect(email.bodyText?.trim()).toBe('plain body');
+      expect(email.bodyHtml?.trim()).toBe('<p>html body</p>');
+    });
+
+    it('descends into multipart/mixed instead of returning the container', async () => {
+      // The old code hardcoded part '1', which on this shape is the
+      // multipart/alternative container: boundaries and undecoded base64.
+      client.fetchOne.mockResolvedValue(
+        message(
+          42,
+          mime(
+            'Content-Type: multipart/mixed; boundary="outer"',
+            '',
+            '--outer',
+            'Content-Type: multipart/alternative; boundary="inner"',
+            '',
+            '--inner',
+            'Content-Type: text/plain; charset=utf-8',
+            '',
+            'the real text',
+            '--inner--',
+            '--outer',
+            'Content-Type: application/pdf; name="r.pdf"',
+            'Content-Disposition: attachment; filename="r.pdf"',
+            'Content-Transfer-Encoding: base64',
+            '',
+            'JVBERi0xLjQK',
+            '--outer--',
+          ),
+        ),
+      );
+
+      const email = await service.getEmail('test', 'INBOX:42');
+
+      expect(email.bodyText?.trim()).toBe('the real text');
+      expect(email.bodyText).not.toContain('--inner');
+      expect(email.bodyText).not.toContain('JVBERi0');
+    });
+
+    it('skips attachment parts when choosing the body', async () => {
+      client.fetchOne.mockResolvedValue(
+        message(
+          42,
+          mime(
+            'Content-Type: multipart/mixed; boundary="m"',
+            '',
+            '--m',
+            'Content-Type: text/plain; charset=utf-8',
+            'Content-Disposition: attachment; filename="notes.txt"',
+            '',
+            'attached notes',
+            '--m',
+            'Content-Type: text/plain; charset=utf-8',
+            '',
+            'the message itself',
+            '--m--',
+          ),
+        ),
+      );
+
+      const email = await service.getEmail('test', 'INBOX:42');
+
+      expect(email.bodyText?.trim()).toBe('the message itself');
+    });
+
+    it('decodes base64 transfer encoding', async () => {
+      client.fetchOne.mockResolvedValue(
+        message(
+          42,
+          mime(
+            'Content-Type: text/plain; charset=utf-8',
+            'Content-Transfer-Encoding: base64',
+            '',
+            Buffer.from('decoded from base64').toString('base64'),
+          ),
+        ),
+      );
+
+      const email = await service.getEmail('test', 'INBOX:42');
+
+      expect(email.bodyText).toBe('decoded from base64');
+    });
+
+    it('decodes quoted-printable, including soft line breaks', async () => {
+      client.fetchOne.mockResolvedValue(
+        message(
+          42,
+          mime(
+            'Content-Type: text/plain; charset=utf-8',
+            'Content-Transfer-Encoding: quoted-printable',
+            '',
+            'soft=',
+            'wrapped =3D sign',
+          ),
+        ),
+      );
+
+      const email = await service.getEmail('test', 'INBOX:42');
+
+      expect(email.bodyText?.trim()).toBe('softwrapped = sign');
+    });
+
+    it('decodes ISO-2022-JP bodies', async () => {
+      // ESC $ B ... ESC ( B — the escape-sequence charset most Japanese mail
+      // still arrives in, which a plain utf-8 read turns into mojibake.
+      const jis = Buffer.from([
+        0x1b, 0x24, 0x42, 0x46, 0x7c, 0x4b, 0x5c, 0x38, 0x6c, 0x1b, 0x28, 0x42,
+      ]);
+      client.fetchOne.mockResolvedValue(
+        message(42, mime('Content-Type: text/plain; charset=ISO-2022-JP', '', jis)),
+      );
+
+      const email = await service.getEmail('test', 'INBOX:42');
+
+      expect(email.bodyText?.trim()).toBe('日本語');
+    });
+
+    it('unfolds continuation headers', async () => {
+      client.fetchOne.mockResolvedValue(
+        message(
+          42,
+          mime(
+            'Content-Type: text/plain; charset=utf-8',
+            'References: <one@example.test>',
+            '\t<two@example.test>',
+            '',
+            'body',
+          ),
+        ),
+      );
+
+      const email = await service.getEmail('test', 'INBOX:42');
+
+      expect(email.headers.references).toBe('<one@example.test> <two@example.test>');
+      expect(email.references).toEqual(['<one@example.test>', '<two@example.test>']);
+    });
+
+    it('previews list entries with the same MIME walk', async () => {
+      client.search.mockResolvedValue([42]);
+      client.fetch.mockReturnValue(iterate(message(42, ALTERNATIVE)));
+
+      const { items } = await service.listEmails('test', { mailbox: 'INBOX' });
+
+      expect(items[0]?.preview).toBe('plain body');
     });
   });
 });
